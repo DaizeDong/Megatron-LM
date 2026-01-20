@@ -203,8 +203,24 @@ class TopKRouter(Router):
             self.ga_steps = None
 
         self.router_replay = None
+        self.bias_predictor = None
         if self.config.enable_routing_replay:
             self.router_replay = RouterReplay()
+            # Router bias predictor for R2-only predicted routing replay
+            if self.config.enable_router_bias_predictor:
+                # Initialize bias predictor as nn.Linear with zero initialization
+                self.bias_predictor = torch.nn.Linear(
+                    self.config.hidden_size,
+                    self.config.num_moe_experts,
+                    bias=False,
+                    device=torch.cuda.current_device(),
+                    dtype=self.config.params_dtype
+                )
+                # Zero initialization
+                torch.nn.init.zeros_(self.bias_predictor.weight)
+                setattr(self.bias_predictor.weight, 'sequence_parallel', self.config.sequence_parallel)
+                # Mark bias_predictor parameters for separate learning rate
+                setattr(self.bias_predictor.weight, 'is_bias_predictor', True)
 
     def _maintain_float32_expert_bias(self):
         """

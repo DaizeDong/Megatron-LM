@@ -485,6 +485,23 @@ class TransformerConfig(ModelParallelConfig):
     enable_routing_replay: bool = False
     """If True, enable the routing replay feature for MoE layers."""
 
+    enable_router_bias_predictor: bool = False
+    """If True, enable router bias predictor for predicted routing replay.
+    This adds an extra nn.Linear(hidden_size -> num_experts) next to each router,
+    initialized to zero, to predict routing biases."""
+
+    enable_topk_union: bool = False
+    """If True, use combined topk_indices from both original & corrected logits from predictor."""
+
+    bias_predictor_loss_type: str = "kl"
+    """Loss type for training the bias predictor. Options: 'l2', 'kl'， 'kl-post'.
+    Only effective when enable_router_bias_predictor is True."""
+
+    bias_predictor_lr_mult: float = 1000.0
+    """Learning rate multiplier for bias predictor parameters.
+    The bias predictor will use lr = base_lr * bias_predictor_lr_mult.
+    Only effective when enable_bias_predictor is True. Default is 1000.0."""
+
     moe_router_topk_limited_devices: Optional[int] = None
     """Number of EP ranks to consider for each token in group-limited routing,
     DEPRECATED and replaced by moe_router_num_groups and moe_router_group_topk.
@@ -706,6 +723,13 @@ class TransformerConfig(ModelParallelConfig):
 
     flash_decode: bool = False
     """ Use the optimized flash decoding kernel during inference. """
+
+    batch_invariant_mode: bool = False
+    """If true, uses batch-invariant kernels that provide deterministic forward execution regardless
+       of batch size. This ensures bitwise identical results when the same inputs are processed
+       in different batch configurations. This will significantly affect speed of 
+       training and inference as the kernels are not full optimized.
+       Defaults to False."""
 
     use_te_activation_func: bool = False
     """Whether to use ffn activation functions implemented by TransformerEngine"""
@@ -1628,6 +1652,11 @@ class TransformerConfig(ModelParallelConfig):
             assert not self.add_bias_linear
             assert not self.add_qkv_bias
             assert not self.use_kitchen
+
+        if self.batch_invariant_mode:
+            assert (
+                self.attention_backend == AttnBackend.flash
+            ), "Batch invariant mode only supports FlashAttention"
 
 
 @dataclass
