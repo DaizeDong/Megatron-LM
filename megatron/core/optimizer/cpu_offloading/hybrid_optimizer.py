@@ -1,8 +1,16 @@
 # Copyright (c) 2025, NVIDIA CORPORATION and Alibaba PAI. All rights reserved.
+import logging
+import os
 from collections import defaultdict
 from typing import Dict
 
 import torch
+
+_hdo_logger = logging.getLogger(__name__)
+
+
+def _bp_diag_enabled():
+    return int(os.environ.get('VERL_DEBUG_PREDICTOR_SYNC', '0')) >= 1
 
 
 def _param_generator(cpu_optimizer):
@@ -101,8 +109,25 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
                 gpu_param = self.cpu_copys_map_gpu_param[param]
                 grad = getattr(gpu_param, "decoupled_grad", gpu_param.grad)
                 if grad is None:
+                    if _bp_diag_enabled() and getattr(gpu_param, '_is_bp_shard', False):
+                        print(
+                            f"[BPDiag][set_sub_optim_grads] bp shard: decoupled_grad=None "
+                            f"gpu_param_grad_is_none={gpu_param.grad is None} "
+                            f"gpu_param_shape={tuple(gpu_param.shape)}",
+                            flush=True,
+                        )
                     param.requires_grad = False
                     continue
+
+                if _bp_diag_enabled() and getattr(gpu_param, '_is_bp_shard', False):
+                    print(
+                        f"[BPDiag][set_sub_optim_grads] bp shard: "
+                        f"decoupled_grad_norm={grad.detach().float().norm().item():.6e} "
+                        f"decoupled_grad_shape={tuple(grad.shape)} "
+                        f"decoupled_grad_dtype={str(grad.dtype)} "
+                        f"gpu_param_shape={tuple(gpu_param.shape)}",
+                        flush=True,
+                    )
 
                 param.requires_grad = False
                 if param not in self.cpu_copy_map_grad:
@@ -121,8 +146,19 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
                 with torch.cuda.stream(self._h2d_stream):
                     for param in _param_generator(optimizer):
                         gpu_param = self.cpu_copys_map_gpu_param[param]
+                        if _bp_diag_enabled() and getattr(gpu_param, '_is_bp_shard', False):
+                            print(
+                                f"[BPDiag][H2D_hook] bp shard: "
+                                f"cpu_fp32_copy_norm={param.detach().float().norm().item():.6e} "
+                                f"cpu_fp32_shape={tuple(param.shape)} "
+                                f"cpu_fp32_dtype={str(param.dtype)} "
+                                f"gpu_shard_shape={tuple(gpu_param.shape)}",
+                                flush=True,
+                            )
                         gpu_param.data.copy_(param.data, non_blocking=True)
-                self._d2h_stream.record_event().wait(torch.cuda.current_stream())
+                # The copy-back is queued on the H2D stream, so callers that keep using the
+                # current stream must wait on H2D completion rather than the D2H stream.
+                self._h2d_stream.record_event().wait(torch.cuda.current_stream())
 
             return param_copy_back_gpu_hook
 
@@ -172,6 +208,26 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
             if d2h_event is not None:
                 d2h_event.synchronize()
             cpu_optimizer.step(closure)
+
+        if self.overlap_cpu_optimizer_d2h_h2d and self.cpu_optimizers:
+            torch.cuda.current_stream().wait_stream(self._h2d_stream)
+
+        # Diagnostic: log GPU shard norm for bias_predictor after H2D sync.
+        # param_groups holds the original GPU bf16 shards; gpu_params_map_cpu_copy maps them
+        # to their CPU fp32 copies.
+        if _bp_diag_enabled():
+            for group in self.param_groups:
+                for gpu_shard in group['params']:
+                    if getattr(gpu_shard, '_is_bp_shard', False):
+                        cpu_fp32 = self.gpu_params_map_cpu_copy.get(gpu_shard, None)
+                        cpu_norm = cpu_fp32.detach().float().norm().item() if cpu_fp32 is not None else float('nan')
+                        print(
+                            f"[BPDiag][after_H2D_sync] bp shard: "
+                            f"gpu_shard_norm={gpu_shard.detach().float().norm().item():.6e} "
+                            f"cpu_fp32_norm={cpu_norm:.6e} "
+                            f"gpu_shard_shape={tuple(gpu_shard.shape)}",
+                            flush=True,
+                        )
 
         # Sync state and param_groups to HDO after each step.
         # NOTE: It is possible for the optimizer to change the properties

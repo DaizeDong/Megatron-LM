@@ -5,6 +5,7 @@
 
 import gc
 import itertools
+import os
 from collections import ChainMap
 from dataclasses import replace
 from logging import getLogger
@@ -407,6 +408,11 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                     # Store handle to main_param.
                     model_param.main_param = shard_main_param
                     model_param.main_param_sharded = True
+
+                    # Tag shard for diagnostic logging of bias_predictor updates.
+                    if shard_model_param is not None and getattr(model_param, 'is_bias_predictor', False):
+                        shard_model_param._is_bp_shard = True
+                        shard_model_param._bp_param_range = (param_range.start, param_range.end)
 
                     # Add to group.
                     model_float16_params_this_group.append(model_param)
@@ -2377,6 +2383,9 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         if self.ddp_config.use_megatron_fsdp:
             return
 
+        import logging as _logging
+        _diag_logger = _logging.getLogger(__name__)
+
         # Utility method for copying group grads.
         def copy_group_grads(model_groups, shard_main_groups):
             for model_group, shard_main_group in zip(model_groups, shard_main_groups):
@@ -2388,6 +2397,20 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
                     model_grad = model_param.main_grad
                     shard_model_grad = model_grad.view(-1)[param_range.start : param_range.end]
+
+                    # Diagnostic logging for bias_predictor weight updates.
+                    if getattr(model_param, 'is_bias_predictor', False) and \
+                            int(os.environ.get('VERL_DEBUG_PREDICTOR_SYNC', '0')) >= 1:
+                        full_grad_norm = model_grad.detach().float().norm().item()
+                        shard_grad_norm = shard_model_grad.detach().float().norm().item()
+                        print(
+                            f"[BPDiag][_copy_grads] param_shape={tuple(model_param.shape)} "
+                            f"param_range=[{param_range.start}:{param_range.end}] "
+                            f"full_main_grad_norm={full_grad_norm:.6e} "
+                            f"shard_grad_norm={shard_grad_norm:.6e} decoupled_grad=setting_now",
+                            flush=True,
+                        )
+
                     if self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8:
                         # Pytorch requires a param and its' grad to be the same dtype, but we want
                         # their types to be different in precision-aware optimizer. So we use
@@ -2599,5 +2622,20 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                     model_chunk.start_param_sync()
         if timers is not None:
             timers('params-all-gather').stop()
+
+        # Diagnostic: log bias_predictor param norm after all-gather.
+        if int(os.environ.get('VERL_DEBUG_PREDICTOR_SYNC', '0')) >= 1:
+            import logging as _logging
+            _diag_logger = _logging.getLogger(__name__)
+            for model_group, shard_group in zip(self.model_float16_groups, self.shard_float16_groups):
+                for model_param, shard_param in zip(model_group, shard_group):
+                    if getattr(model_param, 'is_bias_predictor', False):
+                        param_norm = model_param.data.detach().float().norm().item()
+                        shard_norm = shard_param.detach().float().norm().item() if shard_param is not None else float('nan')
+                        print(
+                            f"[BPDiag][after_allgather] param_shape={tuple(model_param.shape)} "
+                            f"full_param_norm={param_norm:.6e} shard_norm={shard_norm:.6e}",
+                            flush=True,
+                        )
 
         return update_successful
